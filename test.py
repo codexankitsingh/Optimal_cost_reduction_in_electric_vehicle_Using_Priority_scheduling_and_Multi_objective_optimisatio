@@ -7,7 +7,7 @@ Integrated Stage-I (Priority Scheduling) and Stage-II (GA) pipeline.
 - Stage-I: priority scheduling (select top-M EVs).
 - Stage-II: GA-based power scheduling over admitted EVs (uses DEAP).
 - CLI:
-    --ev-file   : path to EV CSV/JSON (auto-detects 'evs_30.csv' if present)
+    --ev-file   : path to EV CSV/JSON (auto-detects 'evs.csv' if present)
     --chargers  : number of chargers (M). Default = 10
 """
 
@@ -207,7 +207,7 @@ def run_stage1(ev_list: List[Dict], system_params: Dict) -> Tuple[List[Dict], Di
     admitted = [ev for ev in ev_list if ev['id'] in admitted_ids]
 
     # Print summary
-    print("=== Stage-I Priority Scheduling (Numerical Example) ===\n")
+    print("=== Stage-I Priority Scheduling ===\n")
     print("Step 1 — Urgency (DeltaE, p_req, phi) (Eq. (7),(9),(10)):")
     for ev in ev_list:
         dE = details[ev['id']]['DeltaE']
@@ -596,10 +596,10 @@ def main():
                         help='Number of chargers (M). Default = 10')
     args = parser.parse_args()
 
-    # Auto-detect evs_30.csv when no --ev-file specified
-    if args.ev_file is None and os.path.exists('evs_30.csv'):
-        args.ev_file = 'evs_30.csv'
-        print("No --ev-file provided; found 'evs_30.csv' in current directory and will use it.")
+    # Auto-detect evs.csv when no --ev-file specified
+    if args.ev_file is None and os.path.exists('evs.csv'):
+        args.ev_file = 'evs.csv'
+        print("No --ev-file provided; found 'evs.csv' in current directory and will use it.")
 
     # Load EV pool (either from file or default example)
     if args.ev_file:
