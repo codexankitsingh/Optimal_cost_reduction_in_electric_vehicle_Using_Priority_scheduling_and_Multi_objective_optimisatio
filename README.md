@@ -1,7 +1,6 @@
 ````markdown
+# This project is part of a research porject and research paper is under consideration in IEEE confrence for publishment.
 # Optimal EV Charging Scheduler with Priority Admission and Multi-Objective Optimization
-
-**Status:** Prototype / research code (Python + some supporting C++ sample code).
 
 ## Project Overview
 
@@ -150,9 +149,8 @@ Use these CSVs for plotting and comparing the performance of different admission
 
 ## License & Contact
 
-Include a license file in the repo (e.g., MIT) if you want to open-source this code publicly.
-
   * **Author:** Ankit Kumar Singh
+  * **Email:** singhankit171819@gmail.com
 
 <!-- end list -->
 
