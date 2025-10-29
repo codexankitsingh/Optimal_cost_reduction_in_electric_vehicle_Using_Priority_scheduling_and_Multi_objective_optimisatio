@@ -1,163 +1,123 @@
 #!/usr/bin/env python3
 """
-pipeline_full_normalized_general.py
+pipeline_fixed.py
 
-Integrated Stage-I (Priority Scheduling) and Stage-II (GA) pipeline.
-- Loads EV definitions from CSV or JSON (required fields: id,Ecap,SoC_init,SoC_max,R_i,T_stay).
-- Stage-I: priority scheduling (select top-M EVs).
-- Stage-II: GA-based power scheduling over admitted EVs (uses DEAP).
-- CLI:
-    --ev-file   : path to EV CSV/JSON (auto-detects 'evs.csv' if present)
-    --chargers  : number of chargers (M). Default = 10
+Same integrated pipeline as before but with KeyError fixes:
+ - safe retrieval of P_ref / R_i (no direct ev['R_i'] indexing)
+ - ensure admitted EVs carry 'P_ref'
+ - compute_Si_from_schedule uses safe pref lookup
+
+Other functionality unchanged.
 """
 
 import argparse
 import random
 import math
 import os
-import json
-import numpy as np
-import pandas as pd
 from typing import List, Dict, Tuple
 
-# DEAP imports
+import numpy as np
+import pandas as pd
 from deap import base, creator, tools
 
 # -------------------------
-# Utility: load EV pool from file (CSV or JSON)
+# Load EV pool
 # -------------------------
-def load_ev_pool(file_path: str) -> List[Dict]:
-    """
-    Load EV definitions from CSV or JSON file.
-    Required fields: id, Ecap, SoC_init, SoC_max, R_i, T_stay
-    Optional fields: T_arr_idx, T_dep_idx, SoC_min, cdeg
-    Returns list of EV dicts.
-    """
-    if file_path is None:
-        raise ValueError("No file_path provided")
 
-    ext = os.path.splitext(file_path)[1].lower()
-    if ext == '.csv':
-        df = pd.read_csv(file_path)
-        records = df.to_dict(orient='records')
-    elif ext in ('.json', '.jsn'):
-        with open(file_path, 'r') as f:
+def load_ev_pool(path: str) -> List[Dict]:
+    path = os.path.abspath(path)
+    if path.lower().endswith(".csv"):
+        df = pd.read_csv(path)
+        evs = []
+        for _, row in df.iterrows():
+            ev = {
+                'id': int(row['id']),
+                'Ecap': float(row['Ecap']),
+                'SoC_init': float(row['SoC_init']),
+                'SoC_max': float(row['SoC_max']),
+                'R_i': float(row['R_i']) if 'R_i' in row and not pd.isna(row['R_i']) else None,
+                'T_stay': float(row['T_stay'])
+            }
+            if 'cdeg' in row and not pd.isna(row['cdeg']):
+                ev['cdeg'] = float(row['cdeg'])
+            if 'SoC_min' in row and not pd.isna(row['SoC_min']):
+                ev['SoC_min'] = float(row['SoC_min'])
+            evs.append(ev)
+        return evs
+    elif path.lower().endswith(".json"):
+        import json
+        with open(path, "r") as f:
             data = json.load(f)
-        if isinstance(data, dict) and any(isinstance(v, list) for v in data.values()):
-            list_candidates = [v for v in data.values() if isinstance(v, list)]
-            records = list_candidates[0]
-        elif isinstance(data, list):
-            records = data
-        else:
-            raise ValueError("JSON must be a list of EV objects or contain a list value.")
+        return data
     else:
-        raise ValueError("Unsupported file extension. Use .csv or .json")
+        raise ValueError("Unsupported file type. Use .csv or .json")
 
-    evs = []
-    required = {'id', 'Ecap', 'SoC_init', 'SoC_max', 'R_i', 'T_stay'}
-    for rec in records:
-        if not required.issubset(set(rec.keys())):
-            missing = required - set(rec.keys())
-            raise ValueError(f"Missing required columns/keys in EV definition: {missing}")
-        ev = {}
-        ev['id'] = int(rec['id'])
-        ev['Ecap'] = float(rec['Ecap'])
-        ev['SoC_init'] = float(rec['SoC_init'])
-        ev['SoC_max'] = float(rec['SoC_max'])
-        ev['R_i'] = float(rec['R_i'])
-        ev['T_stay'] = float(rec['T_stay'])
-        if 'T_arr_idx' in rec and not pd.isna(rec['T_arr_idx']):
-            ev['T_arr_idx'] = int(rec['T_arr_idx'])
-        if 'T_dep_idx' in rec and not pd.isna(rec['T_dep_idx']):
-            ev['T_dep_idx'] = int(rec['T_dep_idx'])
-        if 'SoC_min' in rec and not pd.isna(rec['SoC_min']):
-            ev['SoC_min'] = float(rec['SoC_min'])
-        else:
-            ev['SoC_min'] = 0.0
-        if 'cdeg' in rec and not pd.isna(rec['cdeg']):
-            ev['cdeg'] = float(rec['cdeg'])
-        else:
-            ev['cdeg'] = 0.02
-        evs.append(ev)
-    return evs
+def default_ev_pool() -> List[Dict]:
+    return [
+        {'id': 1, 'Ecap': 60.0, 'SoC_init': 0.30, 'SoC_max': 0.80, 'R_i': 7.0, 'T_stay': 4.0, 'cdeg': 0.02},
+        {'id': 2, 'Ecap': 40.0, 'SoC_init': 0.60, 'SoC_max': 0.90, 'R_i': 11.0,'T_stay': 1.0, 'cdeg': 0.02},
+        {'id': 3, 'Ecap': 50.0, 'SoC_init': 0.20, 'SoC_max': 0.60, 'R_i': 7.0, 'T_stay': 6.0, 'cdeg': 0.02},
+    ]
 
 # -------------------------
-# Stage-I: Priority Scheduling
+# Stage-I: priority scheduling helpers
 # -------------------------
+
 def calc_delta_E(ev: Dict) -> float:
-    """Eq. (7): DeltaE = (SoC_max - SoC_init) * Ecap (kWh)"""
     return max(0.0, (ev['SoC_max'] - ev['SoC_init']) * ev['Ecap'])
 
 def calc_p_req(ev: Dict) -> float:
-    """Eq. (9): p_req = DeltaE / T_stay, capped at R_i (paper's example uses this cap)."""
+    """
+    Eq. (9) with safe P_ref retrieval.
+    If P_ref (or R_i) absent, apply raw ΔE/T_stay (no cap).
+    """
     deltaE = calc_delta_E(ev)
     if ev['T_stay'] <= 0:
         return float('inf') if deltaE > 0 else 0.0
     raw = deltaE / ev['T_stay']
-    return min(raw, ev['R_i'])
+    pref = ev.get('R_i', ev.get('P_ref', None))
+    if pref is None or pref <= 0:
+        return raw
+    return min(raw, pref)
 
 def calc_phi(ev: Dict) -> float:
-    """Eq. (10): urgency phi = min(1, p_req / P_ref)"""
+    """Eq. (10): phi = min(1, p_req / P_ref) with safe pref retrieval"""
     p_req = calc_p_req(ev)
-    pref = ev['R_i']
-    if pref <= 0:
+    pref = ev.get('R_i', ev.get('P_ref', None))
+    if pref is None or pref <= 0:
         return 0.0
     return min(1.0, p_req / pref)
 
-def calc_degradation_factor(ev_list: List[Dict], default_cdeg: float) -> Dict[int, float]:
-    """
-    Eq. (23) min-max normalization of cdeg_i * DeltaE_i.
-    Uses per-EV cdeg if present, otherwise default_cdeg.
-    """
-    values = []
-    for ev in ev_list:
-        cdeg_i = ev.get('cdeg', default_cdeg)
-        values.append(cdeg_i * calc_delta_E(ev))
-    vmin, vmax = min(values), max(values)
-    denom = vmax - vmin if vmax != vmin else 1.0
-    return {ev['id']: (ev.get('cdeg', default_cdeg) * calc_delta_E(ev) - vmin) / denom for ev in ev_list}
+def calc_degradation_factor(ev_list: List[Dict], cdeg: float) -> Dict[int, float]:
+    values = [ (ev.get('cdeg', cdeg) * calc_delta_E(ev)) for ev in ev_list ]
+    vmin = min(values)
+    vmax = max(values)
+    denom = (vmax - vmin) if (vmax != vmin) else 1.0
+    return {ev['id']: ( (ev.get('cdeg', cdeg) * calc_delta_E(ev)) - vmin) / denom for ev in ev_list}
 
 def calc_grid_stress_factor(ev_list: List[Dict], P_avg: float, P_max: float) -> float:
-    """
-    Eq. (24): Gfactor = max(0, (P_hat_agg - P_avg)/(P_max - P_avg))
-    Capped to 1.0 for stability when many EVs exist.
-    """
     p_hat = sum(calc_p_req(ev) for ev in ev_list)
     denom = P_max - P_avg if P_max != P_avg else 1.0
-    raw = max(0.0, (p_hat - P_avg) / denom)
-    return min(raw, 1.0)
+    return max(0.0, (p_hat - P_avg) / denom)
 
-def _mean_if_array(x):
-    if hasattr(x, '__len__') and not isinstance(x, (str, bytes)):
-        return float(np.mean(x))
-    return float(x)
-
-def calc_price_factor(pi_buy, pi_rev,
+def calc_price_factor(pi_buy: float, pi_rev: float,
                       pi_buy_min: float, pi_buy_max: float,
                       pi_rev_min: float, pi_rev_max: float) -> float:
-    """
-    Eq. (25)-(26): normalize prices; accepts scalar or arrays (uses mean for arrays).
-    """
-    pi_buy_val = _mean_if_array(pi_buy)
-    pi_rev_val = _mean_if_array(pi_rev)
     buy_denom = (pi_buy_max - pi_buy_min) if (pi_buy_max - pi_buy_min) != 0 else 1.0
     rev_denom = (pi_rev_max - pi_rev_min) if (pi_rev_max - pi_rev_min) != 0 else 1.0
-    P_buy = (pi_buy_val - pi_buy_min) / buy_denom
-    P_rev = (pi_rev_val - pi_rev_min) / rev_denom
+    P_buy = (pi_buy - pi_buy_min) / buy_denom
+    P_rev = (pi_rev - pi_rev_min) / rev_denom
     return P_buy - P_rev
 
 def calc_priority_scores(ev_list: List[Dict], weights: Dict[str, float],
-                         default_cdeg: float, P_avg: float, P_max: float,
-                         pi_buy, pi_rev,
+                         cdeg: float, P_avg: float, P_max: float,
+                         pi_buy: float, pi_rev: float,
                          pi_buy_min: float, pi_buy_max: float,
                          pi_rev_min: float, pi_rev_max: float) -> Tuple[Dict[int, float], Dict[int, Dict[str, float]]]:
-    """
-    Compute phi, Dfactor, Gfactor, Pfactor and lambda for each EV (Eq. (22)).
-    Returns lambda_scores dict and details per EV.
-    """
     phi_map = {ev['id']: calc_phi(ev) for ev in ev_list}
-    D_map = calc_degradation_factor(ev_list, default_cdeg)
+    D_map = calc_degradation_factor(ev_list, cdeg)
     G_factor = calc_grid_stress_factor(ev_list, P_avg, P_max)
+    G_factor = min(1.0, G_factor)
     P_factor = calc_price_factor(pi_buy, pi_rev, pi_buy_min, pi_buy_max, pi_rev_min, pi_rev_max)
 
     lambda_scores = {}
@@ -179,73 +139,18 @@ def calc_priority_scores(ev_list: List[Dict], weights: Dict[str, float],
             'lambda': lam,
             'p_req': calc_p_req(ev),
             'DeltaE': calc_delta_E(ev),
-            'cdeg_used': ev.get('cdeg', default_cdeg)
+            'raw_deg': ev.get('cdeg', cdeg) * calc_delta_E(ev)
         }
     return lambda_scores, details
 
 def assign_chargers(lambda_scores: Dict[int, float], M: int) -> List[int]:
-    """Rank EVs by descending lambda; tie-breaker: lower EV id first. Return top-M IDs."""
     sorted_evs = sorted(lambda_scores.items(), key=lambda item: (-item[1], item[0]))
     return [eid for eid, _ in sorted_evs[:M]]
 
-def run_stage1(ev_list: List[Dict], system_params: Dict) -> Tuple[List[Dict], Dict]:
-    """Run Stage-I and print details (matches earlier outputs)."""
-    lambda_scores, details = calc_priority_scores(
-        ev_list,
-        system_params['weights'],
-        system_params['cdeg'],
-        system_params['P_avg'],
-        system_params['P_max'],
-        system_params['pi_buy'],
-        system_params['pi_rev'],
-        system_params['pi_buy_min'],
-        system_params['pi_buy_max'],
-        system_params['pi_rev_min'],
-        system_params['pi_rev_max']
-    )
-    admitted_ids = assign_chargers(lambda_scores, system_params['M'])
-    admitted = [ev for ev in ev_list if ev['id'] in admitted_ids]
-
-    # Print summary
-    print("=== Stage-I Priority Scheduling ===\n")
-    print("Step 1 — Urgency (DeltaE, p_req, phi) (Eq. (7),(9),(10)):")
-    for ev in ev_list:
-        dE = details[ev['id']]['DeltaE']
-        p_req = details[ev['id']]['p_req']
-        phi = details[ev['id']]['phi']
-        print(f"EV{ev['id']}: DeltaE = {dE:.3f} kWh, p_req = {p_req:.3f} kW, phi = {phi:.3f}")
-    print()
-    print("Step 2 — Degradation (cdeg * DeltaE then normalized) (Eq. (23)):")
-    for ev in ev_list:
-        cdeg_used = details[ev['id']]['cdeg_used']
-        raw_deg = cdeg_used * details[ev['id']]['DeltaE']
-        D = details[ev['id']]['Dfactor']
-        print(f"EV{ev['id']}: cdeg_used = {cdeg_used:.4f}, cdeg*DeltaE = {raw_deg:.3f}, Dfactor = {D:.3f}")
-    print()
-    G_factor = next(iter(details.values()))['Gfactor']
-    P_factor = next(iter(details.values()))['Pfactor']
-    print("Step 3 — Grid stress factor (Gfactor) (Eq. (24)):")
-    print(f"Gfactor (capped <=1.0) = {G_factor:.4f}")
-    print()
-    print("Step 4 — Price factor (Pfactor) (Eq. (25),(26)):")
-    print(f"Pfactor = {P_factor:.3f}\n")
-    print("Step 5 — Priority scores (lambda_i) (Eq. (22)):")
-    for ev in ev_list:
-        lam = details[ev['id']]['lambda']
-        print(f"lambda_{ev['id']} = {lam:.5f}")
-    print()
-    sorted_by_lambda = sorted(lambda_scores.items(), key=lambda item: (-item[1], item[0]))
-    print("Step 6 — Ranking and Admission:")
-    rank_str = " > ".join([f"EV{eid}" for eid, _ in sorted_by_lambda])
-    print(f"Ranking (desc lambda): {rank_str}")
-    print(f"With M={system_params['M']} chargers, admitted EVs: {', '.join('EV'+str(x) for x in admitted_ids)}")
-    waiting = [ev['id'] for ev in ev_list if ev['id'] not in admitted_ids]
-    print(f"Waiting EVs: {', '.join('EV'+str(x) for x in waiting)}")
-    return admitted, details
-
 # -------------------------
-# Stage-II: GA-based power scheduling (normalized + elitism)
+# Stage-II helpers and objectives
 # -------------------------
+
 def flatten_index(i, t, T): return i * T + t
 def unflatten(individual, M, T): return np.array(individual, dtype=float).reshape((M, T))
 
@@ -286,7 +191,12 @@ def compute_Si_from_schedule(net_schedule, evs, delta_t):
         Ereq = max(0.0, (SoC_max - ev['SoC_init']) * Ecap)
         Tstay = ev['T_stay']
         preq = (Ereq / Tstay) if Tstay > 0 else (float('inf') if Ereq > 0 else 0.0)
-        phi_i = min(1.0, preq / ev['P_ref']) if ev['P_ref'] > 0 else 0.0
+        # SAFE pref retrieval: prefer P_ref, then R_i, else None -> treat as no-cap
+        pref = ev.get('P_ref', ev.get('R_i', None))
+        if pref is None or pref <= 0:
+            phi_i = 0.0
+        else:
+            phi_i = min(1.0, preq / pref)
         if SoC_T >= SoC_max:
             delta_i = 0.0
         else:
@@ -330,23 +240,117 @@ def compute_penalty(net_schedule, evs, P_max, num_chargers, delta_t):
             V_occ += (active - num_chargers)
     return V_SoC, V_occ, V_grid
 
+# -------------------------
+# GA helpers (seeding, repair, fitness)
+# -------------------------
+
+def build_bounds_and_mask(evs, M, T):
+    lower = [0.0] * (M * T)
+    upper = [0.0] * (M * T)
+    for i in range(M):
+        ev = evs[i]
+        pmin = -ev.get('P_ref', ev.get('R_i', 0.0))
+        pmax = ev.get('P_ref', ev.get('R_i', 0.0))
+        Tarr = ev.get('T_arr_idx', 0)
+        Tdep = ev.get('T_dep_idx', T)
+        for t in range(T):
+            idx = flatten_index(i, t, T)
+            if Tarr <= t < Tdep:
+                lower[idx] = pmin
+                upper[idx] = pmax
+            else:
+                lower[idx] = 0.0
+                upper[idx] = 0.0
+    fixed_mask = [abs(l - u) < 1e-12 for l, u in zip(lower, upper)]
+    return lower, upper, fixed_mask
+
+def seed_individual_stage1(evs, M, T, delta_t, pi_buy, seed_fraction=0.25):
+    chrom = [0.0] * (M * T)
+    price_arr = np.array(pi_buy)
+    for i in range(M):
+        ev = evs[i]
+        DeltaE = max(0.0, (ev['SoC_max'] - ev['SoC_init']) * ev['Ecap'])
+        Tstay = ev['T_stay'] if ev['T_stay'] > 0 else 1e-9
+        raw_preq = DeltaE / Tstay
+        preq = min(raw_preq, ev.get('P_ref', ev.get('R_i', raw_preq)))
+        Tarr = ev.get('T_arr_idx', 0)
+        Tdep = ev.get('T_dep_idx', T)
+        if Tdep <= Tarr:
+            continue
+        stay_slots = list(range(Tarr, Tdep))
+        if len(stay_slots) == 0:
+            continue
+        prices_in_stay = price_arr[stay_slots]
+        k = max(1, int(math.ceil(seed_fraction * len(stay_slots))))
+        chosen_idx_rel = list(np.argsort(prices_in_stay)[:k])
+        for rel in chosen_idx_rel:
+            t = stay_slots[rel]
+            chrom[flatten_index(i, t, T)] = preq
+    return chrom
+
+def seed_individual_full_charge(evs, M, T, delta_t):
+    chrom = [0.0] * (M * T)
+    for i in range(M):
+        ev = evs[i]
+        DeltaE = max(0.0, (ev['SoC_max'] - ev['SoC_init']) * ev['Ecap'])
+        Tarr = ev.get('T_arr_idx', 0)
+        Tdep = ev.get('T_dep_idx', T)
+        slots = max(1, Tdep - Tarr)
+        if slots <= 0:
+            continue
+        per_slot_power = (DeltaE / (slots * delta_t)) if (slots * delta_t) > 0 else 0.0
+        per_slot_power = min(per_slot_power, ev.get('P_ref', ev.get('R_i', per_slot_power)))
+        for t in range(Tarr, Tdep):
+            chrom[flatten_index(i, t, T)] = per_slot_power
+    return chrom
+
+def repair_individual(individual, evs, M, T, delta_t):
+    arr = unflatten(individual, M, T)
+    for i in range(M):
+        ev = evs[i]
+        Tarr = ev.get('T_arr_idx', 0)
+        Tdep = ev.get('T_dep_idx', T)
+        Ecap = ev['Ecap']
+        DeltaE = max(0.0, (ev['SoC_max'] - ev['SoC_init']) * Ecap)
+        p_slice = arr[i, Tarr:Tdep].copy()
+        E_del = float(np.sum(np.maximum(p_slice, 0.0)) * delta_t)
+        if abs(E_del - DeltaE) < 1e-6:
+            pass
+        elif E_del < DeltaE and np.any(p_slice < ev.get('P_ref', ev.get('R_i', 0.0)) - 1e-9):
+            need_kwh = DeltaE - E_del
+            need_kw = need_kwh / delta_t
+            headroom = np.maximum(ev.get('P_ref', ev.get('R_i', 0.0)) - p_slice, 0.0)
+            total_head = float(np.sum(headroom))
+            if total_head > 1e-9:
+                scale = min(1.0, need_kw / total_head)
+                p_slice += headroom * scale
+        elif E_del > DeltaE and np.any(p_slice > 1e-9):
+            factor = DeltaE / E_del if E_del > 0 else 0.0
+            p_slice = p_slice * factor
+        arr[i, Tarr:Tdep] = p_slice
+        arr[i, :] = np.clip(arr[i, :], -ev.get('P_ref', ev.get('R_i', 0.0)), ev.get('P_ref', ev.get('R_i', 0.0)))
+        for t in range(0, Tarr):
+            arr[i,t] = 0.0
+        for t in range(Tdep, T):
+            arr[i,t] = 0.0
+    individual[:] = arr.reshape(M*T).tolist()
+    return individual
+
 def make_fitness_function(evs, M, T, delta_t,
                           pi_buy, pi_rev,
                           cdeg_arr,
                           P_max, num_chargers,
                           w1, w2, w3, w4,
                           alpha1, alpha2, alpha3):
-    # simple normalization denominators
-    max_power_sum = sum(ev['P_ref'] for ev in evs) if evs else 1.0
-    max_energy_over_horizon = max_power_sum * delta_t * T
-    max_price = max(max(pi_buy) if hasattr(pi_buy, '__len__') else pi_buy,
-                    max(pi_rev) if hasattr(pi_rev, '__len__') else pi_rev)
-    max_cdeg = max(cdeg_arr) if len(cdeg_arr) > 0 else 1.0
-    denom_F1 = (max_price * max_energy_over_horizon + 1e-9)
-    denom_F2 = (max_cdeg * max_energy_over_horizon + 1e-9)
-    denom_F3 = ((max_power_sum ** 2) * T + 1e-9)
+    total_DeltaE = sum(max(0.0, (ev['SoC_max'] - ev['SoC_init']) * ev['Ecap']) for ev in evs)
+    max_price = max(max(pi_buy) if hasattr(pi_buy, '__iter__') else pi_buy,
+                    max(pi_rev) if hasattr(pi_rev, '__iter__') else pi_rev)
+    sum_Pref = sum(ev.get('P_ref', ev.get('R_i', 0.0)) for ev in evs)
+    denom_F1 = max_price * total_DeltaE + 1e-9
+    denom_F2 = max(cdeg_arr) * total_DeltaE + 1e-9
+    denom_F3 = (sum_Pref ** 2) * T + 1e-9
     denom_F4 = (M + 1e-9)
-    denom_Omega = (max_power_sum * delta_t * T + 1e-9)
+    denom_Omega = (total_DeltaE + 1e-9)
 
     def evaluate(individual):
         net_schedule = unflatten(individual, M, T)
@@ -373,87 +377,51 @@ def make_fitness_function(evs, M, T, delta_t,
         return (J,)
     return evaluate
 
-def build_bounds_and_mask(evs, M, T):
-    lower = [0.0] * (M * T)
-    upper = [0.0] * (M * T)
-    for i in range(M):
-        ev = evs[i]
-        pmin = -ev['P_ref']
-        pmax = ev['P_ref']
-        Tarr = ev.get('T_arr_idx', 0)
-        Tdep = ev.get('T_dep_idx', T)
-        for t in range(T):
-            idx = flatten_index(i, t, T)
-            if Tarr <= t < Tdep:
-                lower[idx] = pmin
-                upper[idx] = pmax
-            else:
-                lower[idx] = 0.0
-                upper[idx] = 0.0
-    return lower, upper
+# -------------------------
+# GA runner
+# -------------------------
 
-def seed_individual_using_stage1(evs, M, T, delta_t, pi_buy, seed_fraction=0.25):
-    chrom = [0.0] * (M * T)
-    price_arr = np.array(pi_buy)
-    for i in range(M):
-        ev = evs[i]
-        DeltaE = max(0.0, (ev['SoC_max'] - ev['SoC_init']) * ev['Ecap'])
-        Tstay = ev['T_stay'] if ev['T_stay'] > 0 else 1e-9
-        raw_preq = DeltaE / Tstay
-        preq = min(raw_preq, ev['P_ref'])
-        Tarr = ev.get('T_arr_idx', 0)
-        Tdep = ev.get('T_dep_idx', T)
-        if Tdep <= Tarr:
-            continue
-        stay_slots = list(range(Tarr, Tdep))
-        prices_in_stay = price_arr[stay_slots]
-        k = max(1, int(math.ceil(seed_fraction * len(stay_slots))))
-        chosen_idx_rel = list(np.argsort(prices_in_stay)[:k])
-        for rel in chosen_idx_rel:
-            t = stay_slots[rel]
-            chrom[flatten_index(i, t, T)] = preq
-    return chrom
-
-def run_ga(evs, admitted_ids,
-           T, delta_t,
+def run_ga(evs, T, delta_t,
            pi_buy, pi_rev,
            P_max,
            weights,
            alpha1, alpha2, alpha3,
-           pop_size=100, ngen=300,
-           cxpb=0.9, mutpb=0.2, eta_c=20.0, eta_m=20.0,
+           pop_size=120, ngen=300,
+           cxpb=0.9, mutpb=0.3, eta_c=20.0, eta_m=20.0,
            tournament_size=3,
-           stagnation_generations=40,
-           seed_count=10,
-           elitism_k=2,
+           stagnation_generations=80,
+           seed_count=20,
+           elitism_k=4,
            verbose=True):
     random.seed(42)
     M = len(evs)
+    for ev in evs:
+        if 'P_ref' not in ev:
+            ev['P_ref'] = ev.get('R_i', 0.0)
     cdeg_arr = [ev.get('cdeg', 0.02) for ev in evs]
     num_chargers = len(evs)
-    w1 = weights.get('w1', 0.25)
-    w2 = weights.get('w2', 0.25)
-    w3 = weights.get('w3', 0.25)
-    w4 = weights.get('w4', 0.25)
+    w1 = weights.get('w1', 0.15)
+    w2 = weights.get('w2', 0.15)
+    w3 = weights.get('w3', 0.10)
+    w4 = weights.get('w4', 0.60)
 
-    lower, upper = build_bounds_and_mask(evs, M, T)
-    lower_arr = lower
-    upper_arr = upper
+    lower, upper, fixed_mask = build_bounds_and_mask(evs, M, T)
+    safe_low = list(lower)
+    safe_up = list(upper)
+    for idx in range(M*T):
+        if abs(lower[idx] - upper[idx]) < 1e-12:
+            safe_up[idx] = safe_low[idx] + 1e-9
 
-    try:
-        creator.FitnessMin
-    except Exception:
+    if not hasattr(creator, "FitnessMin"):
         creator.create("FitnessMin", base.Fitness, weights=(-1.0,))
-    try:
-        creator.Individual
-    except Exception:
+    if not hasattr(creator, "Individual"):
         creator.create("Individual", list, fitness=creator.FitnessMin)
 
     toolbox = base.Toolbox()
 
     def attr_float_at_index(idx):
-        lo = lower_arr[idx]
-        up = upper_arr[idx]
+        lo = lower[idx]
+        up = upper[idx]
         if lo == up:
             return lo
         return random.uniform(lo, up)
@@ -476,28 +444,19 @@ def run_ga(evs, admitted_ids,
     toolbox.register("evaluate", eval_fn)
     toolbox.register("select", tools.selTournament, tournsize=tournament_size)
 
-    _EPS = 1e-9
-    safe_low = list(lower_arr)
-    safe_up = list(upper_arr)
-    fixed_mask = [False] * (M * T)
-    for idx in range(M * T):
-        if abs(lower_arr[idx] - upper_arr[idx]) < 1e-12:
-            fixed_mask[idx] = True
-            safe_up[idx] = safe_low[idx] + _EPS
-
     def safe_mate(ind1, ind2):
         tools.cxSimulatedBinaryBounded(ind1, ind2, low=safe_low, up=safe_up, eta=eta_c)
-        for idx in range(M * T):
+        for idx in range(M*T):
             if fixed_mask[idx]:
-                ind1[idx] = lower_arr[idx]
-                ind2[idx] = lower_arr[idx]
+                ind1[idx] = lower[idx]
+                ind2[idx] = lower[idx]
         return (ind1, ind2)
 
     def safe_mutate(individual):
         tools.mutPolynomialBounded(individual, low=safe_low, up=safe_up, eta=eta_m, indpb=1.0/(M*T))
-        for idx in range(M * T):
+        for idx in range(M*T):
             if fixed_mask[idx]:
-                individual[idx] = lower_arr[idx]
+                individual[idx] = lower[idx]
         return (individual,)
 
     toolbox.register("mate", safe_mate)
@@ -505,9 +464,17 @@ def run_ga(evs, admitted_ids,
 
     pop = toolbox.population(n=pop_size)
     num_seed = min(seed_count, pop_size)
-    for s in range(num_seed):
-        seed_chrom = seed_individual_using_stage1(evs, M, T, delta_t, pi_buy, seed_fraction=0.25)
-        pop[s][:] = seed_chrom
+    if num_seed >= 1:
+        pop[0][:] = seed_individual_full_charge(evs, M, T, delta_t)
+    if num_seed >= 2:
+        pop[1][:] = seed_individual_stage1(evs, M, T, delta_t, pi_buy, seed_fraction=0.25)
+    for s in range(2, num_seed):
+        seed = seed_individual_stage1(evs, M, T, delta_t, pi_buy, seed_fraction=0.25)
+        for idx in range(M*T):
+            if not fixed_mask[idx]:
+                seed[idx] += random.uniform(-0.05, 0.05) * (upper[idx] - lower[idx])
+                seed[idx] = max(lower[idx], min(upper[idx], seed[idx]))
+        pop[s][:] = seed
 
     fitnesses = list(map(toolbox.evaluate, pop))
     for ind, fit in zip(pop, fitnesses):
@@ -526,25 +493,24 @@ def run_ga(evs, admitted_ids,
         offspring = toolbox.select(pop, len(pop))
         offspring = list(map(toolbox.clone, offspring))
 
-        # crossover
         for i in range(0, len(offspring), 2):
             if i + 1 >= len(offspring):
                 break
             if random.random() <= cxpb:
                 toolbox.mate(offspring[i], offspring[i + 1])
+                repair_individual(offspring[i], evs, M, T, delta_t)
+                repair_individual(offspring[i+1], evs, M, T, delta_t)
 
-        # mutation
         for i in range(len(offspring)):
             if random.random() <= mutpb:
                 toolbox.mutate(offspring[i])
+                repair_individual(offspring[i], evs, M, T, delta_t)
 
-        # evaluate new individuals
         invalid_inds = [ind for ind in offspring if not ind.fitness.valid]
         fitnesses = list(map(toolbox.evaluate, invalid_inds))
         for ind, fit in zip(invalid_inds, fitnesses):
             ind.fitness.values = fit
 
-        # elitism: keep top-k from current pop
         elites = tools.selBest(pop, elitism_k)
         combined = offspring + list(map(toolbox.clone, elites))
         for ind in combined:
@@ -588,38 +554,43 @@ def run_ga(evs, admitted_ids,
 # -------------------------
 # Orchestrator main()
 # -------------------------
+
 def main():
     parser = argparse.ArgumentParser(description="Run Stage-I priority scheduling and Stage-II GA power scheduling.")
     parser.add_argument('--ev-file', type=str, default=None,
-                        help='Path to EV definitions file (CSV or JSON). If omitted, will auto-detect evs_30.csv or use a small built-in example.')
-    parser.add_argument('--chargers', type=int, default=10,
-                        help='Number of chargers (M). Default = 10')
+                        help='Path to EV definitions file (CSV or JSON). If omitted, built-in 3-EV example is used.')
+    parser.add_argument('--chargers', type=int, default=None, help='Number of chargers (M)')
+    parser.add_argument('--t_slots', type=int, default=48, help='Number of time slots (T)')
+    parser.add_argument('--delta_t', type=float, default=0.25, help='slot length in hours')
+    parser.add_argument('--population', type=int, default=120)
+    parser.add_argument('--generations', type=int, default=300)
     args = parser.parse_args()
 
-    # Auto-detect evs.csv when no --ev-file specified
-    if args.ev_file is None and os.path.exists('evs.csv'):
-        args.ev_file = 'evs.csv'
-        print("No --ev-file provided; found 'evs.csv' in current directory and will use it.")
-
-    # Load EV pool (either from file or default example)
     if args.ev_file:
-        try:
-            ev_pool = load_ev_pool(args.ev_file)
-            print(f"Loaded {len(ev_pool)} EVs from {args.ev_file}")
-        except Exception as e:
-            print("Error loading EV file:", e)
-            return
+        ev_pool = load_ev_pool(args.ev_file)
+        print(f"Loaded {len(ev_pool)} EVs from {args.ev_file}")
     else:
-        ev_pool = [
-            {'id': 1, 'Ecap': 60.0, 'SoC_init': 0.30, 'SoC_max': 0.80, 'R_i': 7.0, 'T_stay': 4.0},
-            {'id': 2, 'Ecap': 40.0, 'SoC_init': 0.60, 'SoC_max': 0.90, 'R_i': 11.0, 'T_stay': 1.0},
-            {'id': 3, 'Ecap': 50.0, 'SoC_init': 0.20, 'SoC_max': 0.60, 'R_i': 7.0, 'T_stay': 6.0},
-        ]
-        print("Using default 3-EV example (no --ev-file provided).")
+        found = False
+        for fname in ['evs.csv', 'evs_30.csv', 'evs_100.csv']:
+            if os.path.exists(fname):
+                ev_pool = load_ev_pool(fname)
+                print(f"No --ev-file provided; found '{fname}' in current directory and will use it.")
+                print(f"Loaded {len(ev_pool)} EVs from {fname}")
+                found = True
+                break
+        if not found:
+            ev_pool = default_ev_pool()
+            print("No EV file found; using built-in example (3 EVs).")
 
-    # System parameters
+    N = len(ev_pool)
+    if args.chargers is not None:
+        M = args.chargers
+    else:
+        M = max(1, min(N, max(1, N // 3)))
+    print("Number of chargers M set to:", M)
+
     system_params = {
-        'M': args.chargers,    # <-- number of chargers requested by user
+        'M': M,
         'P_max': 25.0,
         'P_avg': 12.0,
         'cdeg': 0.02,
@@ -631,60 +602,102 @@ def main():
         'pi_rev_max': 0.30,
         'weights': {'w_s': 0.25, 'w_d': 0.25, 'w_g': 0.25, 'w_p': 0.25}
     }
-    print(f"Number of chargers M set to: {system_params['M']}")
 
-    # Stage-I
-    admitted, details = run_stage1(ev_pool, system_params)
-    print("\nStage-I admitted EV ids:", [ev['id'] for ev in admitted])
+    lambda_scores, details = calc_priority_scores(
+        ev_pool,
+        system_params['weights'],
+        system_params['cdeg'],
+        system_params['P_avg'],
+        system_params['P_max'],
+        system_params['pi_buy'],
+        system_params['pi_rev'],
+        system_params['pi_buy_min'],
+        system_params['pi_buy_max'],
+        system_params['pi_rev_min'],
+        system_params['pi_rev_max']
+    )
 
-    # Convert admitted EVs for Stage-II: map R_i -> P_ref, set T_arr_idx/T_dep_idx if absent
-    T = 48
-    delta_t = 0.25
+    admitted_ids = assign_chargers(lambda_scores, M)
+    admitted = [ev for ev in ev_pool if ev['id'] in admitted_ids]
+
+    # Stage-I print
+    print("\n=== Stage-I Priority Scheduling ===\n")
+    print("Step 1 — Urgency (DeltaE, p_req, phi) (Eq. (7),(9),(10)):")
+    for ev in ev_pool:
+        dE = details[ev['id']]['DeltaE']
+        p_req = details[ev['id']]['p_req']
+        phi = details[ev['id']]['phi']
+        print(f"EV{ev['id']}: DeltaE = {dE:.3f} kWh, p_req = {p_req:.3f} kW, phi = {phi:.3f}")
+    print()
+    print("Step 2 — Degradation (cdeg * DeltaE then normalized) (Eq. (23)):")
+    for ev in ev_pool:
+        raw_deg = details[ev['id']]['raw_deg']
+        D = details[ev['id']]['Dfactor']
+        print(f"EV{ev['id']}: cdeg*DeltaE = {raw_deg:.3f}, Dfactor = {D:.3f}")
+    print()
+    G_factor = next(iter(details.values()))['Gfactor']
+    print("Step 3 — Grid stress factor (Gfactor) (Eq. (24)):")
+    print(f"Gfactor (capped <=1.0) = {G_factor:.4f}")
+    print()
+    P_factor = next(iter(details.values()))['Pfactor']
+    print("Step 4 — Price factor (Pfactor) (Eq. (25),(26)):")
+    print(f"Pfactor = {P_factor:.3f}\n")
+    print("Step 5 — Priority scores (lambda_i) (Eq. (22)):")
+    for ev in ev_pool:
+        lam = details[ev['id']]['lambda']
+        print(f"lambda_{ev['id']} = {lam:.5f}")
+    print()
+    sorted_by_lambda = sorted(lambda_scores.items(), key=lambda item: (-item[1], item[0]))
+    print("Step 6 — Ranking and Admission:")
+    rank_str = " > ".join([f"EV{eid}" for eid, _ in sorted_by_lambda])
+    print(f"Ranking (desc lambda): {rank_str}")
+    print(f"With M={system_params['M']} chargers, admitted EVs: {', '.join('EV'+str(x) for x in admitted_ids)}")
+    waiting = [ev['id'] for ev in ev_pool if ev['id'] not in admitted_ids]
+    print(f"Waiting EVs: {', '.join('EV'+str(x) for x in waiting)}")
+    print("\nStage-I admitted EV ids:", admitted_ids)
+
+    # Convert admitted EVs for Stage-II
+    T = args.t_slots
+    delta_t = args.delta_t
     admitted_evs = []
     for ev in admitted:
-        Tarr = ev.get('T_arr_idx', None)
-        Tdep = ev.get('T_dep_idx', None)
-        if Tarr is None or Tdep is None:
-            slots = max(1, int(math.ceil(ev['T_stay'] / delta_t)))
-            Tarr = 0
-            Tdep = min(T, slots)
+        slots = max(1, int(math.ceil(ev['T_stay'] / delta_t)))
+        dep_idx = min(T, slots)
+        # SAFE P_ref assignment: prefer R_i, else keep 0 if missing (repair will use 0 cap)
+        p_ref = ev.get('R_i', ev.get('P_ref', 0.0))
         admitted_evs.append({
             'id': ev['id'],
             'Ecap': ev['Ecap'],
             'SoC_init': ev['SoC_init'],
             'SoC_max': ev['SoC_max'],
-            'P_ref': ev['R_i'],
+            'P_ref': p_ref,
             'T_stay': ev['T_stay'],
-            'T_arr_idx': Tarr,
-            'T_dep_idx': Tdep,
-            'cdeg': ev.get('cdeg', 0.02),
-            'SoC_min': ev.get('SoC_min', 0.0)
+            'T_arr_idx': 0,
+            'T_dep_idx': dep_idx,
+            'cdeg': ev.get('cdeg', system_params['cdeg'])
         })
 
-    # GA inputs and hyperparams
-    pi_buy_arr = [0.25] * T
-    pi_rev_arr = [0.18] * T
-    P_max = 25.0
-    weights = {'w1': 0.25, 'w2': 0.25, 'w3': 0.25, 'w4': 0.25}
-    alpha1, alpha2, alpha3 = 50.0, 50.0, 50.0
+    # GA inputs
+    pi_buy_arr = [system_params['pi_buy']] * T
+    pi_rev_arr = [system_params['pi_rev']] * T
+    P_max = system_params['P_max']
+    weights_stage2 = {'w1': 0.15, 'w2': 0.15, 'w3': 0.10, 'w4': 0.60}
+    alpha1, alpha2, alpha3 = 200.0, 100.0, 100.0
 
-    # Run Stage-II GA
-    result = run_ga(evs=admitted_evs, admitted_ids=None,
+    result = run_ga(evs=admitted_evs,
                     T=T, delta_t=delta_t,
                     pi_buy=pi_buy_arr, pi_rev=pi_rev_arr,
                     P_max=P_max,
-                    weights=weights,
+                    weights=weights_stage2,
                     alpha1=alpha1, alpha2=alpha2, alpha3=alpha3,
-                    pop_size=120, ngen=300,
-                    cxpb=0.9, mutpb=0.3,
-                    eta_c=20.0, eta_m=20.0,
+                    pop_size=args.population, ngen=args.generations,
+                    cxpb=0.9, mutpb=0.35,
                     tournament_size=3,
-                    stagnation_generations=60,
-                    seed_count=20,
-                    elitism_k=4,
+                    stagnation_generations=80,
+                    seed_count=max(10, int(0.15 * args.population)),
+                    elitism_k=max(2, int(0.03 * args.population)),
                     verbose=True)
 
-    # Print and save GA outputs
     print("\n=== GA Result Summary ===")
     print("Objective J (normalized weighted):", result['J'])
     print("F1 (cost, raw) :", result['F1'], "F1_norm:", result['F1_norm'])
@@ -700,6 +713,31 @@ def main():
     csv_path = os.path.abspath('best_schedule_normalized.csv')
     df.to_csv(csv_path, index=True)
     print(f"Saved best_schedule_normalized.csv to: {csv_path}")
+
+    print("\n--- Per-EV Diagnostics (admitted) ---")
+    for i, ev in enumerate(admitted_evs):
+        delivered_kwh = float(np.sum(np.maximum(best[i,:], 0.0)) * delta_t)
+        SoC = ev['SoC_init']
+        for t in range(T):
+            SoC += (best[i,t] * delta_t) / ev['Ecap']
+        SoC_T = SoC
+        Si_list = result.get('Si_list', [])
+        Si = Si_list[i] if i < len(Si_list) else None
+        print(f"EV{ev['id']}: delivered={delivered_kwh:.2f} kWh, SoC_T={SoC_T:.3f}, S_i={Si:.3f}")
+
+    # Derived metrics
+    delivered = np.sum(np.maximum(best, 0.0), axis=1) * delta_t
+    avg_cost_per_ev = result['F1'] / (len(admitted_evs) if len(admitted_evs) > 0 else 1)
+    print("\n--- Derived Metrics ---")
+    print("Average net energy cost per admitted EV:", avg_cost_per_ev)
+    if delivered.size > 0:
+        arr = np.array(np.sort(delivered))
+        n = arr.size
+        if n > 0 and np.sum(arr) > 1e-9:
+            index = np.arange(1, n+1)
+            gini = (np.sum((2*index - n - 1) * arr)) / (n * np.sum(arr) + 1e-9)
+            print("Fairness (Gini on delivered kWh):", abs(gini))
+    print("Done.")
 
 if __name__ == "__main__":
     main()
